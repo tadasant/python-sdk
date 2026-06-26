@@ -947,7 +947,7 @@ class MCPServer(Generic[LifespanResultT]):
                     Middleware(
                         AuthenticationMiddleware,
                         backend=BearerAuthBackend(
-                            self._token_verifier, resource_server_url=self.settings.auth.resource_server_url
+                            self._token_verifier, resource_server_url=self.settings.auth.enforced_audience
                         ),
                     ),
                     # Add the auth context middleware to store
