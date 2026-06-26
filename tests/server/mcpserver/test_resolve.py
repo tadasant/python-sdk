@@ -1,6 +1,7 @@
 """Tests for resolver dependency injection (MRTR) on MCPServer tools."""
 
 from collections.abc import Callable
+from datetime import datetime
 from typing import Annotated, Any, Literal
 
 import pytest
@@ -879,8 +880,6 @@ async def test_two_instances_of_one_method_do_not_collide():
 
 @pytest.mark.anyio
 async def test_non_serializable_sibling_resolver_does_not_break_rounds():
-    from datetime import datetime
-
     mcp = MCPServer(name="NonSerializable")
 
     async def clock(ctx: Context) -> datetime:
@@ -1078,3 +1077,58 @@ async def test_factory_closures_get_distinct_wire_keys():
         result = await _drive_mrtr(client, "tool", {}, answer)
         assert isinstance(result.content[0], TextContent)
         assert result.content[0].text == "A,B"
+
+
+@pytest.mark.anyio
+async def test_eliciting_resolver_without_elicit_arm_restores_a_typed_model():
+    # A resolver annotated `-> Login` that actually returns `Elicit(...)` has no
+    # `Elicit[T]` return arm, so `elicit_schema` is None. Its answer, restored from
+    # request_state in a 3+ round flow, must still come back as a Login model (not a
+    # raw dict) so a dependent resolver/tool can use its attributes.
+    mcp = MCPServer(name="LyingAnnotation")
+
+    # Annotated without an `Elicit[T]` return arm, so `elicit_schema` is None.
+    async def login(ctx: Context) -> object:
+        return Elicit("user?", Login)
+
+    async def confirm(login: Annotated[Login, Resolve(login)]) -> Elicit[Confirm]:
+        return Elicit(f"as {login.username}?", Confirm)
+
+    @mcp.tool()
+    async def act(
+        login: Annotated[Login, Resolve(login)],
+        confirm: Annotated[Confirm, Resolve(confirm)],
+    ) -> str:
+        return f"{login.username}:{confirm.ok}"
+
+    def answer(key: str, params: ElicitRequestFormParams) -> ElicitResult:
+        if "user" in params.message:
+            return ElicitResult(action="accept", content={"username": "octocat"})
+        assert "as octocat?" in params.message  # login restored as a real model
+        return ElicitResult(action="accept", content={"ok": True})
+
+    async with Client(mcp) as client:
+        result = await _drive_mrtr(client, "act", {}, answer)
+        assert isinstance(result.content[0], TextContent)
+        assert result.content[0].text == "octocat:True"
+
+
+def test_wire_key_is_worker_stable_for_methods_and_callable_objects():
+    from mcp.server.mcpserver.resolve import _state_key
+
+    class Service:
+        async def token(self, ctx: Context) -> Login:
+            return Login(username="x")  # pragma: no cover
+
+    class CallableResolver:
+        async def __call__(self, ctx: Context) -> Login:
+            return Login(username="x")  # pragma: no cover
+
+    a, b = Service(), Service()
+    # No id(...) in the key: two instances of one method get the same base (they are
+    # disambiguated at registration, not here), and the key carries no memory address.
+    assert _state_key(a.token) == _state_key(b.token)
+    assert "#" not in _state_key(a.token)
+    assert _state_key(a.token).endswith("Service.token")
+    # Callable objects key by their type's qualname (they have no `__qualname__`).
+    assert _state_key(CallableResolver()).endswith("CallableResolver")

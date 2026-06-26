@@ -345,16 +345,17 @@ class _Resolution:
 
 
 def _state_key(fn: Callable[..., Any]) -> str:
-    """Process-stable wire key for a resolver's elicitation.
+    """Worker-stable base wire key for a resolver, derived only from registration data.
 
-    `id(fn)` isn't stable across `input_required` rounds, so key `input_requests` /
-    `request_state` by `module:qualname`. Bound methods add their `__self__` id so
-    two instances of the same method get distinct questions and stored outcomes
-    (the registered `Resolve(...)` holds the instance for the call's lifetime).
+    `input_requests`/`request_state` must round-trip through the client and resume on
+    any worker (stateless HTTP), so the key carries no `id(...)`: it is the resolver's
+    `module:qualname` (a callable object uses its type's). Distinct resolvers that
+    share this base - two instances of one method, two closures from one factory - are
+    disambiguated deterministically by `build_resolver_plans` (`base`, `base#1`, ...).
     """
-    base = f"{getattr(fn, '__module__', '')}:{getattr(fn, '__qualname__', fn)!s}"
-    bound_self = getattr(fn, "__self__", None)
-    return f"{base}#{id(bound_self)}" if bound_self is not None else base
+    qualname = getattr(fn, "__qualname__", None) or type(fn).__qualname__
+    module = getattr(fn, "__module__", None) or type(fn).__module__
+    return f"{module}:{qualname}"
 
 
 async def resolve_arguments(
@@ -411,7 +412,11 @@ async def _resolve(fn: Callable[..., Any], res: _Resolution) -> ElicitationResul
     if wire_key in res.pending:
         # Already asked this round by another consumer; don't run the resolver again.
         raise _Pending
-    if wire_key in res.state:
+    # Restore a prior round's outcome directly only when its model is known from the
+    # `Elicit[T]` return arm. Without that (a resolver that elicits but isn't annotated
+    # `-> ... Elicit[T]`), fall through and re-run the resolver so `_elicit` can
+    # re-validate the stored answer against the live `Elicit.schema`.
+    if wire_key in res.state and (plan.elicit_schema is not None or res.state[wire_key].action != "accept"):
         outcome = _outcome_from_state(res.state[wire_key], plan.elicit_schema)
         res.cache[cache_key] = outcome
         # Carry the restored answer forward: if a later resolver is still pending,
@@ -463,6 +468,13 @@ async def _elicit(elicit: Elicit[Any], key: str, res: _Resolution) -> Elicitatio
     """Turn a resolver's `Elicit` into an outcome via the negotiated transport."""
     if not res.input_required:
         return await res.context.elicit(elicit.message, elicit.schema)
+
+    # Answered in a prior round (restored without a known schema, e.g. an unannotated
+    # resolver): re-validate the stored entry against the live `Elicit.schema`.
+    if key in res.state and key not in res.answers:
+        outcome = _outcome_from_state(res.state[key], elicit.schema)
+        res.elicited[key] = outcome
+        return outcome
 
     answer = res.answers.get(key)
     if answer is None:
